@@ -1,0 +1,13 @@
+torch
+transformers
+accelerate
+datasets
+scikit-learn
+pandas
+numpy
+tqdm
+matplotlib
+seaborn
+huggingface_hub
+safetensors
+pyarrow

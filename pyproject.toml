@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cam-deception-detection"
+version = "0.1.0"
+description = "CAM/WTA classifiers over LLM residual-stream truthfulness and deception directions"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "transformers",
+  "accelerate",
+  "datasets",
+  "scikit-learn",
+  "pandas",
+  "numpy",
+  "tqdm",
+  "matplotlib",
+  "seaborn",
+  "huggingface_hub",
+  "safetensors",
+  "pyarrow",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

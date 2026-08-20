@@ -1,326 +1,276 @@
 # CAM-Based LLM Deception Detection
 
-This repository contains research code for detecting **truthfulness and deception in large language models using residual-stream activations and content-addressable memory (CAM)**.
+Research code for detecting truthfulness/deception from transformer residual-stream activations using **INLP-derived CAM rows** and **winner-take-all (WTA)** classifiers.
+
+This repository is a cleaned, modular conversion of three Llama-3.3-70B research notebooks:
+
+- projected CAM/WTA with an unsupervised CAM-row-subspace projection, LSQ quantization-aware training, and Euclidean-compatible scoring;
+- full-dimensional Hamming WTA with learned positive per-row weights;
+- the same Hamming classifier with all CAM rows unweighted.
+
+The original notebooks are preserved in `notebooks/original/`, but the main implementation now lives in importable Python modules under `src/cam_deception/`.
+
+## Core pipeline
+
+```text
+Dataset rows
+   ↓
+Llama-3.3-70B residual stream (layer 33, post-layer)
+   ↓
+Shared example-level train / validation / test split
+   ↓
+INLP logistic-probe directions
+   ↓
+CAM row banks
+   ├── combined/general bank
+   └── per-domain banks
+   ↓
+Classifier family
+   ├── Projected LSQ/QAT WTA
+   ├── Weighted Hamming WTA
+   └── Unweighted Hamming WTA
+   ↓
+Cross-domain AUROC / accuracy / artifacts / heatmaps
+```
+
+The split is constructed once and reused for both CAM-row extraction and WTA training so held-out examples do not leak into the learned probe directions.
+
+## Repository layout
+
+```text
+cam-deception-detection/
+├── src/cam_deception/
+│   ├── activations.py      # Llama loading + layer-33 residual extraction
+│   ├── cache.py            # mmap/NPZ/PT residual cache I/O
+│   ├── cam_rows.py         # logistic probes + INLP + CAM banks
+│   ├── config.py           # experiment dataclasses and defaults
+│   ├── data.py             # truth_spec normalization + optional TQA/FEVER
+│   ├── dataset_view.py     # scope/split views over cached activations
+│   ├── hamming.py          # weighted/unweighted Hamming WTA
+│   ├── metrics.py          # AUROC, thresholding, binary metrics
+│   ├── pipeline.py         # cross-domain experiment orchestration
+│   ├── plotting.py         # AUROC heatmaps
+│   ├── projected_lsq.py    # projection, LSQ, Euclidean/dot WTA
+│   └── splits.py           # shared example-level split
+├── scripts/
+│   ├── extract_activations.py
+│   ├── inspect_cache.py
+│   ├── run_projected_lsq.py
+│   ├── run_hamming.py
+│   └── run_all_classifiers.py
+├── tests/
+│   └── test_core.py
+├── notebooks/original/
+│   ├── CAM_Deception_Detection_70B.ipynb
+│   ├── CAM_Deception_Detection_70B_Hamming_Weighted.ipynb
+│   └── CAM_Deception_Detection_70B_Hamming_Unweighted.ipynb
+├── results/
+├── data/
+├── pyproject.toml
+├── requirements.txt
+└── README.md
+```
+
+## Installation
+
+```bash
+git clone <your-repository-url>
+cd cam-deception-detection
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+For development/testing:
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+## 1. Build or locate the residual-stream cache
+
+The Hamming notebooks do **not** need to load Llama-70B. They operate directly on the activation cache produced by the main extraction pipeline.
+
+To reproduce extraction from the paper datasets:
+
+```bash
+python scripts/extract_activations.py \
+  --clone-truth-spec \
+  --include-external \
+  --output-dir results/llama70b_L33
+```
 
-The project explores whether learned activation-space directions associated with truthful or deceptive behavior can be stored in a compact CAM-style feature bank and used for efficient inference. Alongside classification performance, the work studies the effects of **dimensionality reduction, low-bit quantization, cross-domain generalization, and feature-selection strategies** with the goal of making mechanistic interpretability methods more compatible with hardware-efficient deployment.
+This uses the main notebook defaults:
 
-## Project Overview
+- model: `meta-llama/Llama-3.3-70B-Instruct`
+- layer: `33`
+- hidden state: `post_layer`
+- example representation: mean over assistant-output-token residual streams
+- disk cache: float16 mmap arrays
 
-Modern LLMs encode information about their internal behavior within high-dimensional activation spaces. This project investigates whether those internal representations can be used to distinguish truthful from deceptive responses.
+> Llama-3.3-70B is a large model. Activation extraction requires an appropriately provisioned GPU/multi-GPU environment and Hugging Face access to the model checkpoint. If you already have the residual cache, skip extraction entirely.
 
-The general pipeline is:
+Inspect an existing cache with:
 
-1. Extract residual-stream activations from an intermediate transformer layer.
-2. Learn directions in activation space associated with truthfulness or deception.
-3. Store selected feature vectors as rows in a CAM-style classifier.
-4. Compare an incoming activation against the stored feature bank.
-5. Use learned feature weights and a classification threshold to predict whether the example is truthful or deceptive.
-6. Evaluate how well the system generalizes across datasets and how performance changes under hardware-oriented compression.
+```bash
+python scripts/inspect_cache.py --cache /path/to/..._activations_mmap
+```
 
-Experiments were conducted primarily with **Llama-3.1-8B-Instruct** and **Llama-3.3-70B-Instruct**.
+## 2. Projected LSQ/QAT WTA experiment
 
----
+Equivalent to the main projected/quantized notebook path:
 
-## Key Research Questions
+```bash
+python scripts/run_projected_lsq.py \
+  --cache /path/to/..._activations_mmap \
+  --projection-dim 128 \
+  --bits 3 \
+  --eval-mode euclidean
+```
 
-This project investigates several questions:
+Useful ablations are now command-line switches instead of notebook edits:
 
-* Can residual-stream activations reliably separate truthful and deceptive LLM behavior?
-* Can multiple learned activation directions be used as a CAM-based alternative to a conventional linear probe?
-* How well do learned deception features generalize across domains?
-* How many CAM rows are actually used during classification?
-* How much performance is lost when feature vectors are compressed?
-* Can an **unsupervised dot-product-preserving projection** reduce activation dimensionality while preserving classifier behavior?
-* How does **low-bit quantization using LSQ/QAT** affect classification accuracy and AUROC?
-* Do domain-general feature directions outperform domain-specific directions?
-* Can complementary transformer layers improve detection performance?
+```bash
+# No projection, quantization still enabled
+python scripts/run_projected_lsq.py --cache /path/to/cache --no-projection
 
----
+# Projection only; no LSQ quantization
+python scripts/run_projected_lsq.py --cache /path/to/cache --no-quantization
 
-## Methodology
+# Neither projection nor quantization
+python scripts/run_projected_lsq.py --cache /path/to/cache --no-projection --no-quantization
+```
 
-### Activation Extraction
+### Dot-product-preserving projection
 
-Residual-stream activations are extracted from selected transformer layers using last-token pooling.
+The default projection is **unsupervised**. It constructs an orthonormal basis from the CAM-row span and does not use class labels. When the projection dimension covers the CAM-row rank, projecting both a residual vector and a CAM row preserves their dot product up to numerical precision.
 
-Experiments include:
+### Euclidean-compatible CAM scoring
 
-* **Llama-3.1-8B-Instruct**
+For deployment, learned row weights are baked into augmented rows:
 
-  * Primary layer: Layer 15
+```text
+query_aug = [q, 0]
+row_aug_j = [alpha_j * r_j, sqrt(C - ||alpha_j * r_j||²)]
+```
 
-* **Llama-3.3-70B-Instruct**
+Every augmented row has equal norm, so nearest Euclidean row and maximum weighted dot-product row have the same winner.
 
-  * Primary layer: Layer 33
+## 3. Hamming WTA experiments
 
-The resulting activation vectors represent the model's internal state for each prompt and are used as classifier inputs.
+### Weighted CAM rows
 
----
+```bash
+python scripts/run_hamming.py \
+  --cache /path/to/..._activations_mmap \
+  --method both
+```
 
-### Linear Probing
+The weighted classifier learns a positive scalar for each CAM row before the WTA max.
 
-Linear probes are trained on residual-stream activations to identify directions associated with truthfulness and deception.
+### Unweighted CAM rows
 
-A linear classifier learns a separating direction
+```bash
+python scripts/run_hamming.py \
+  --cache /path/to/..._activations_mmap \
+  --method both \
+  --unweighted
+```
 
-[
-w \in \mathbb{R}^{D}
-]
+The unweighted version uses the maximum **raw normalized Hamming similarity** and one global bias. This replaces the separate unweighted notebook with one shared implementation.
 
-where (D) is the LLM residual-stream dimension.
+### Hash methods
 
-These learned directions provide both:
+`run_hamming.py` supports:
 
-* a conventional classification baseline
-* candidate feature vectors for the CAM classifier
+- `sign`: direct sign hash over the original residual dimensions;
+- `learned_matrix`: a full `d × d` shared matrix initialized to identity and trained through a straight-through sign estimator;
+- `both`: run both experiments.
 
----
+For an 8192-dimensional residual stream, the learned matrix is extremely large. Use `--method sign` when you only need the hardware-friendly direct-sign baseline.
+If you explicitly need the trained full matrix in the saved artifact, add `--save-learned-hash-matrix`; it is omitted by default because an 8192×8192 fp32 matrix is hundreds of MiB before compression.
 
-## CAM / Winner-Take-All Classifier
+## 4. Run all notebook experiment families
 
-Instead of using a single classification vector, the CAM classifier stores a bank of learned feature vectors:
+Once a residual cache exists:
 
-[
-F = {f_1, f_2, ..., f_K}
-]
+```bash
+python scripts/run_all_classifiers.py --cache /path/to/..._activations_mmap
+```
 
-Each incoming activation (x) is compared against every stored feature.
+To avoid the expensive full learned hash matrix:
 
-A similarity score is computed using the dot product:
+```bash
+python scripts/run_all_classifiers.py \
+  --cache /path/to/..._activations_mmap \
+  --skip-learned-hash
+```
 
-[
-s_i = x^\top f_i
-]
+This runs:
 
-Each feature also receives a learned scalar weight:
+1. projected LSQ/QAT WTA;
+2. weighted Hamming WTA;
+3. unweighted Hamming WTA.
 
-[
-s_i = W_i(x^\top f_i)
-]
+## CAM-row extraction
 
-The most responsive feature can then be selected using a **winner-take-all (WTA)** operation.
+The repository preserves the notebook's INLP procedure. A logistic probe is fit to the shared training activations, its normalized weight vector is stored as a CAM row, that direction is projected out, and the process repeats.
 
-This architecture allows multiple independently learned activation directions to participate in classification while remaining compatible with a CAM-style similarity-search architecture.
+Default bank sizes are:
 
----
+- 4 directions per single domain;
+- 10 directions for the combined/general bank.
 
-## Feature Banks
+The positive label convention is:
 
-Experiments compare several approaches to constructing the CAM feature bank.
+```text
+1 = deceptive / false / target behavior
+0 = truthful / honest
+```
 
-### Domain-Specific Features
-
-Feature vectors are trained independently on individual deception or truthfulness domains.
-
-### Domain-General Features
-
-Features from several domains are combined into a single feature bank intended to capture more general representations of truthfulness and deception.
-
-### Random-Vector Control
-
-Random vectors are placed into CAM and trained using the same downstream weighting procedure to determine whether performance comes from meaningful learned activation directions rather than classifier capacity alone.
-
----
-
-## Cross-Domain Evaluation
-
-The classifier is evaluated using cross-domain AUROC matrices.
-
-Each experiment trains features on one dataset or domain and evaluates them across several others.
-
-This allows the project to measure:
-
-* within-domain performance
-* cross-domain transfer
-* domain-specific behavior
-* general deception representations
-
-Evaluation focuses primarily on **AUROC**, with classification accuracy used as an additional metric.
-
----
-
-## Dimensionality Reduction
-
-Large LLM residual streams contain thousands of dimensions, making direct CAM deployment expensive.
-
-To address this, the project evaluates an **unsupervised linear projection to 128 dimensions**.
-
-The projection is designed to preserve the dot products between:
-
-* residual-stream activation vectors
-* stored CAM feature vectors
-
-Because CAM classification depends directly on these similarities, preserving their dot products helps maintain classifier behavior after dimensionality reduction.
-
-Importantly, the projection is **unsupervised** and does not use class labels.
-
-Experiments compare:
-
-* Full-dimensional activations
-* 128-dimensional projected activations
-
----
-
-## Quantization
-
-The project also studies aggressive low-bit quantization of CAM representations.
-
-Experiments use:
-
-* **Learned Step Size Quantization (LSQ)**
-* **Quantization-Aware Training (QAT)**
-* primarily **3-bit quantization**
-
-The objective is to determine how far CAM rows and classifier parameters can be compressed while maintaining useful AUROC.
-
-Ablation experiments compare:
-
-* No compression
-* Projection only
-* Quantization only
-* Projection + quantization
-
----
-
-## Multi-Layer Monitoring
-
-Different transformer layers may encode complementary information.
-
-The project therefore explores classifiers that monitor several transformer layers simultaneously.
-
-The motivation is that:
-
-> When one layer fails to distinguish an example correctly, another layer may contain a stronger representation of the relevant behavior.
-
-Strategies explored include:
-
-* Single-layer baseline
-* Greedy layer selection
-* Accumulative layer combinations
-* Weighted combinations of multiple layers
-
----
-
-## Ablation Studies
-
-The repository contains experiments investigating:
-
-* CAM bank size
-* Number of unique WTA winners
-* Domain-specific vs. domain-general features
-* Random feature vectors
-* Dot-product vs. Euclidean similarity
-* Projection dimension
-* Low-bit quantization
-* Projection vs. quantization performance loss
-* Multi-layer feature combinations
-* Cross-domain transfer
-* Multi-class CAM classification
-
-These experiments are intended to isolate which components of the system are responsible for classifier performance.
-
----
-
-## Models
-
-Primary models used in this project include:
-
-### Meta Llama 3.1 8B Instruct
-
-Used for:
-
-* rapid experimentation
-* classifier development
-* feature-bank experiments
-* multi-layer analysis
-* ablation studies
-
-### Meta Llama 3.3 70B Instruct
-
-Used to evaluate whether the approach scales to substantially larger language models.
-
-Because the full BF16 model is approximately 140 GB, memory-efficient model loading and activation extraction techniques are used for the 70B experiments.
-
----
-
-## Technologies
-
-The project uses:
-
-* Python
-* PyTorch
-* Hugging Face Transformers
-* Llama 3.1 / Llama 3.3
-* NNsight
-* NumPy
-* Pandas
-* scikit-learn
-* HDF5 / h5py
-* Matplotlib
-* FAISS
-* CUDA
-* Quantization-Aware Training
-* Learned Step Size Quantization
-* Linear probing
-* Residual-stream activation analysis
-
----
+The heuristic paper-dataset loader retains the notebook's explicit empirical-domain label-orientation fix. Old caches that predate that fix can be corrected explicitly with `--flip-cached-domain empirical` rather than silently flipping every cache.
 
 ## Evaluation
 
-The primary evaluation metric is **Area Under the Receiver Operating Characteristic Curve (AUROC)**.
+The main reported metric is **AUROC**. Each trained source-domain classifier is evaluated on the shared held-out test examples from every other domain.
 
-Cross-domain experiments are visualized using heatmaps in which:
+The runners save:
 
-* rows represent the domain used to construct or train the classifier
-* columns represent the evaluation dataset
-* each cell contains the resulting AUROC
+- CSV metric tables;
+- cross-domain AUROC heatmaps;
+- compact CAM/classifier `.npz` artifacts;
+- projected/quantized rows for the LSQ path;
+- binary CAM codes for the Hamming path.
 
-Additional analyses include:
+Large activation caches, model checkpoints, and generated artifacts are excluded by `.gitignore`.
 
-* accuracy
-* unique CAM winners
-* cosine similarity distributions
-* feature utilization
-* compression-induced AUROC loss
+## Tests
 
----
+The included tests verify several invariants that were implicit in the notebooks:
 
-## Example Experimental Pipeline
+- no example ID leaks across the shared train/validation/test split;
+- the CAM-row-subspace projection preserves CAM dot products when its dimension covers the row-bank rank;
+- augmented Euclidean scoring agrees with weighted dot-product scoring;
+- unweighted Hamming WTA is exactly the maximum raw Hamming similarity plus the global bias.
 
-```text
-Prompt
-  ↓
-Llama
-  ↓
-Intermediate Transformer Layer
-  ↓
-Residual Stream Activation
-  ↓
-Optional 128-D Projection
-  ↓
-Optional Low-Bit Quantization
-  ↓
-CAM Feature Bank
-  ↓
-Similarity Search / Winner-Take-All
-  ↓
-Learned Feature Weights
-  ↓
-Truthful / Deceptive Prediction
+Run:
+
+```bash
+pytest
 ```
 
----
+## Notes on the conversion
 
-## Research Motivation
+The repository intentionally keeps the experimental behavior close to the uploaded notebooks while removing notebook-specific duplication and hidden state. In particular:
 
-Most mechanistic interpretability methods are evaluated primarily as software techniques. However, deploying activation-based monitoring systems at inference time introduces substantial computational and memory overhead.
+- weighted and unweighted Hamming classifiers now share one implementation controlled by `weighted_rows` / `--unweighted`;
+- shared INLP, split, cache, metrics, and cross-domain evaluation logic is defined once;
+- experiment settings are collected into dataclasses instead of scattered notebook globals;
+- the original notebooks remain available for provenance and result comparison;
+- the global deployment artifact naming is consistently `llama70b` rather than the stray `llama8b` filename that appeared in the notebook save cell.
 
-This project investigates whether interpretability-derived feature directions can instead be mapped onto **content-addressable memory**, where similarity comparisons can be performed efficiently in parallel.
+## Research motivation
 
-The broader goal is to connect:
-
-**LLM interpretability → model monitoring → efficient hardware implementation**
-
-and explore whether model-internal representations can support practical, low-overhead AI safety systems.
-
+The broader goal is to connect LLM interpretability with hardware-efficient model monitoring. Instead of keeping a single software-only linear probe, the project studies whether multiple learned residual-stream directions can be stored as a compact CAM feature bank and queried using simple similarity operations, including aggressively quantized vectors and one-bit Hamming codes.
